@@ -1636,6 +1636,7 @@ fn build_update_write_set_plan(
             join_type: JoinType::Inner,
             using: vec![],
             no_reorder: false,
+            lateral: false,
         });
         from_tables.add_joined_table(target_table);
         from_tables
