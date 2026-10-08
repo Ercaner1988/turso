@@ -7447,6 +7447,7 @@ dependencies = [
  "cc",
  "env_logger",
  "libc",
+ "limbo_csv",
  "tempfile",
  "tracing",
  "tracing-appender",

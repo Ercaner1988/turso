@@ -735,7 +735,7 @@ fn get_subquery_parser<'a>(
                 };
 
                 let plan = prepare_select_plan(
-                    subselect,
+                    *subselect,
                     resolver,
                     program,
                     &outer_query_refs,
@@ -827,7 +827,7 @@ fn get_subquery_parser<'a>(
                     unreachable!();
                 };
                 let plan = prepare_select_plan(
-                    subselect,
+                    *subselect,
                     resolver,
                     program,
                     &outer_query_refs,
@@ -934,7 +934,7 @@ fn get_subquery_parser<'a>(
                     unreachable!();
                 };
                 let plan = prepare_select_plan(
-                    rhs,
+                    *rhs,
                     resolver,
                     program,
                     &outer_query_refs,
