@@ -1762,7 +1762,11 @@ fn parse_from_clause_table(
                 limit: None,
             };
             parse_from_clause_table(
-                ast::SelectTable::Select(join_select, Some(alias)),
+                ast::SelectTable::Select {
+                    select: join_select,
+                    alias: Some(alias),
+                    lateral: false,
+                },
                 resolver,
                 program,
                 table_references,
@@ -2522,7 +2526,13 @@ fn replace_select_table_alias(table: ast::SelectTable, alias: Option<ast::As>) -
         ast::SelectTable::TableCall(name, args, _) => {
             ast::SelectTable::TableCall(name, args, alias)
         }
-        ast::SelectTable::Select(select, _) => ast::SelectTable::Select(select, alias),
+        ast::SelectTable::Select {
+            select, lateral, ..
+        } => ast::SelectTable::Select {
+            select,
+            alias,
+            lateral,
+        },
         ast::SelectTable::Sub(from, _) => ast::SelectTable::Sub(from, alias),
     }
 }

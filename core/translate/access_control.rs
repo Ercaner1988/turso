@@ -12,7 +12,7 @@ use crate::{
     storage::pager::CreateBTreeFlags,
     translate::{
         emitter::Resolver,
-        plan::{TableReferences, WhereTerm},
+        plan::{JoinOrigin, TableReferences, WhereTerm, WhereTermOrigin},
         schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
     },
     util::normalize_ident,
@@ -316,11 +316,15 @@ pub fn add_select_row_security_filters(
         filters.push(WhereTerm {
             expr: visible
                 .unwrap_or_else(|| ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))),
-            from_outer_join: table
+            origin: if table
                 .join_info
                 .as_ref()
                 .is_some_and(|join_info| join_info.is_outer())
-                .then_some(table.internal_id),
+            {
+                WhereTermOrigin::Join(JoinOrigin::new(table.internal_id, true))
+            } else {
+                WhereTermOrigin::Where
+            },
             consumed: false,
         });
     }
