@@ -11373,6 +11373,7 @@ pub fn op_function(
                 state,
                 f.func.call_scalar(
                     &mut state.extension_state,
+                    &program.connection,
                     &state.registers[*start_reg..*start_reg + arg_count],
                 )
             );
@@ -14337,7 +14338,22 @@ pub fn op_drop_sequence(
 ) -> InsnResult {
     load_insn!(DropSequence { db, seq_name }, insn);
     let conn = program.connection.clone();
+    let is_mvcc = conn.mv_store_for_db(*db).is_some();
     conn.with_database_schema_mut(*db, |schema| {
+        // In MVCC mode, track the backing table's root page so integrity_check knows about it.
+        // The btree pages won't be freed until checkpoint, so integrity_check needs
+        // to include them to avoid "page never used" false positives.
+        if is_mvcc {
+            let backing_table_name =
+                crate::translate::sequence::sequence_backing_table_name(seq_name);
+            let root_page = schema
+                .get_btree_table(&backing_table_name)
+                .expect("DROP SEQUENCE: backing table must exist in schema")
+                .root_page;
+            if root_page > 0 {
+                schema.dropped_root_pages.insert(root_page);
+            }
+        }
         schema.remove_sequence(seq_name);
     })?;
     // Drop this connection's stale currval. Otherwise a same-session
@@ -18906,6 +18922,22 @@ fn op_journal_mode_inner(
                     state.registers[*dest].set_text(Text::new(ret))?;
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
+                }
+
+                // SQLite refuses this too. Switching to MVCC inside the user's
+                // transaction wrote to the MVCC log before the MVCC metadata
+                // table existed. After the user's COMMIT or ROLLBACK, the
+                // database could not be opened again.
+                if !program.connection.get_auto_commit() {
+                    let direction = if matches!(new_mode, journal_mode::JournalMode::Mvcc) {
+                        "into"
+                    } else {
+                        "out of"
+                    };
+                    return Err(LimboError::TxError(format!(
+                        "cannot change {direction} mvcc mode from within a transaction"
+                    ))
+                    .into());
                 }
 
                 // Check if database is readonly - cannot change journal mode on readonly databases

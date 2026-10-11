@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::{
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
-    schema::{BTreeTable, Schema, Table},
+    schema::{BTreeTable, Index, Schema, Table},
     Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
@@ -142,21 +142,18 @@ impl Dialect for PostgresDialect {
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
-        register_catalog_modules(options)
+        register_catalog_modules(crate::functions::register_functions(options))
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-        if crate::functions::resolve_scalar(name, arg_count) {
-            return Ok(Some(Func::Dialect(name.to_string())));
-        }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
 
-    fn exec_scalar_function(&self, conn: &Connection, name: &str, args: &[Value]) -> Result<Value> {
-        crate::functions::exec_scalar(conn, name, args)
+    fn requires_custom_types(&self) -> bool {
+        true
     }
 
-    fn requires_custom_types(&self) -> bool {
+    fn qualified_column_uses_nearest_table_only(&self) -> bool {
         true
     }
 }
@@ -190,6 +187,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_input_error_info"
             | "pg_get_tabledef"
             | "pg_tables"
+            | "pg_indexes"
     )
 }
 
@@ -711,24 +709,25 @@ impl SnapshotRows for PgProcTable {
         }
 
         // Extension functions
-        for (name, is_agg, argc, _deterministic) in conn.get_syms_functions() {
+        for (name, is_agg, argc, deterministic) in conn.get_syms_functions() {
             let prokind = if is_agg { "a" } else { "f" };
+            let provolatile = if deterministic { "i" } else { "v" };
 
             rows.push(vec![
-                Value::from_i64(oid),         // oid
-                Value::build_text(name),      // proname
-                Value::from_i64(2200),        // pronamespace (public)
-                Value::from_i64(10),          // proowner
-                Value::from_i64(13),          // prolang (C)
-                Value::from_f64(1.0),         // procost
-                Value::from_f64(0.0),         // prorows
-                Value::from_i64(0),           // provariadic
-                Value::build_text(prokind),   // prokind
-                Value::from_i64(0),           // prosecdef
-                Value::from_i64(0),           // proleakproof
-                Value::from_i64(0),           // proisstrict
-                Value::from_i64(0),           // proretset
-                Value::build_text("v"),       // provolatile (volatile)
+                Value::from_i64(oid),       // oid
+                Value::build_text(name),    // proname
+                Value::from_i64(2200),      // pronamespace (public)
+                Value::from_i64(10),        // proowner
+                Value::from_i64(13),        // prolang (C)
+                Value::from_f64(1.0),       // procost
+                Value::from_f64(0.0),       // prorows
+                Value::from_i64(0),         // provariadic
+                Value::build_text(prokind), // prokind
+                Value::from_i64(0),         // prosecdef
+                Value::from_i64(0),         // proleakproof
+                Value::from_i64(0),         // proisstrict
+                Value::from_i64(0),         // proretset
+                Value::build_text(provolatile),
                 Value::build_text("u"),       // proparallel
                 Value::from_i64(argc as i64), // pronargs
                 Value::from_i64(0),           // pronargdefaults
@@ -953,6 +952,43 @@ impl SnapshotRows for PgTablesTable {
                 Value::from_i64(0),                     // hastriggers
                 Value::from_i64(0),                     // rowsecurity
             ]);
+        }
+
+        rows
+    }
+}
+
+#[derive(Debug)]
+struct PgIndexesTable;
+
+impl SnapshotRows for PgIndexesTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_indexes (
+            schemaname TEXT,
+            tablename TEXT,
+            indexname TEXT,
+            tablespace TEXT,
+            indexdef TEXT
+        )";
+    const ESTIMATED_COST: f64 = 100.0;
+    const ESTIMATED_ROWS: u32 = 50;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let schema = conn.current_schema();
+        let mut rows = Vec::new();
+
+        for (table_name, _) in user_tables_sorted(&schema) {
+            for idx in schema.get_indices(table_name) {
+                if idx.ephemeral {
+                    continue;
+                }
+                rows.push(vec![
+                    Value::Text("public".into()),
+                    Value::Text(table_name.clone().into()),
+                    Value::Text(idx.name.clone().into()),
+                    Value::Null,
+                    Value::build_text(index_definition(table_name, idx)),
+                ]);
+            }
         }
 
         rows
@@ -1904,6 +1940,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         SnapshotCatalog::<PgTablesTable>(PhantomData),
     );
     options = options.native_module(
+        "pg_indexes",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgIndexesTable>(PhantomData),
+    );
+    options = options.native_module(
         "pg_get_tabledef",
         VTabKind::TableValuedFunction,
         CatalogModule {
@@ -2601,33 +2642,37 @@ pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<Stri
                 continue;
             }
             if index_oid == target_oid {
-                let unique = if idx.unique { "UNIQUE " } else { "" };
-                let cols: Vec<String> = idx
-                    .columns
-                    .iter()
-                    .map(|col| {
-                        if let Some(expr) = &col.expr {
-                            expr.to_string()
-                        } else {
-                            col.name.clone()
-                        }
-                    })
-                    .collect();
-                let mut def = format!(
-                    "CREATE {unique}INDEX {} ON {table_name} USING btree ({})",
-                    idx.name,
-                    cols.join(", ")
-                );
-                if let Some(where_clause) = &idx.where_clause {
-                    def.push_str(&format!(" WHERE {where_clause}"));
-                }
-                return Some(def);
+                return Some(index_definition(table_name, idx));
             }
             index_oid += 1;
         }
     }
 
     None
+}
+
+fn index_definition(table_name: &str, idx: &Index) -> String {
+    let unique = if idx.unique { "UNIQUE " } else { "" };
+    let cols: Vec<String> = idx
+        .columns
+        .iter()
+        .map(|col| {
+            if let Some(expr) = &col.expr {
+                expr.to_string()
+            } else {
+                col.name.clone()
+            }
+        })
+        .collect();
+    let mut def = format!(
+        "CREATE {unique}INDEX {} ON {table_name} USING btree ({})",
+        idx.name,
+        cols.join(", ")
+    );
+    if let Some(where_clause) = &idx.where_clause {
+        def.push_str(&format!(" WHERE {where_clause}"));
+    }
+    def
 }
 
 // TODO: Fix tests to use correct API
@@ -2649,6 +2694,7 @@ mod tests {
             "pg_proc",
             "pg_database",
             "pg_tables",
+            "pg_indexes",
             "pg_get_tabledef",
             "pg_index",
             "pg_constraint",

@@ -997,14 +997,6 @@ pub fn translate_insert(
     );
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
-        compute_virtual_columns(
-            program,
-            &ctx.table.columns_topo_sort()?,
-            &dml_ctx,
-            resolver,
-            &btree_table,
-        )?;
-
         // Build raw NEW registers for AFTER triggers. Values are encoded at this point;
         // fire_trigger will decode them via decode_trigger_registers.
         let key_reg = insertion.key_register();
@@ -1770,7 +1762,12 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
         rhs: name_col_reg,
         target_pc: found_label,
         flags: Default::default(),
-        collation: None,
+        collation: Some(super::collate::CollationSeq::NoCase),
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: name_col_reg,
+        dst_reg: table_name_reg,
+        extra_amount: 0,
     });
 
     program.emit_column_or_rowid(seq_cursor_id, 1, r_seq);
@@ -3437,7 +3434,7 @@ fn ensure_sequence_initialized(
         rhs: name_col_reg,
         target_pc: entry_exists_label,
         flags: Default::default(),
-        collation: None,
+        collation: Some(super::collate::CollationSeq::NoCase),
     });
 
     program.emit_insn(Insn::Next {

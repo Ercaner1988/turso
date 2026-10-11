@@ -36,6 +36,7 @@ use crate::{MAIN_DB_ID, TEMP_DB_ID};
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
+use std::any::Any;
 use std::cmp::Ordering as CmpOrdering;
 use std::fmt::Display;
 use std::ops::Deref;
@@ -390,6 +391,7 @@ impl Drop for ExplicitCheckpointGuard {
 /// statements know they need to be reprepared.
 pub struct Connection {
     pub(crate) db: Arc<Database>,
+    pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(crate) pager: ArcSwap<Pager>,
     pub(crate) schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
@@ -641,6 +643,10 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    pub fn context<C: Any>(&self) -> Option<&C> {
+        self.context.as_deref()?.downcast_ref()
+    }
+
     fn schema_reparse_guard(self: &Arc<Connection>) -> SchemaReparseGuard {
         let was_reparsing = self.schema_reparse_in_progress.swap(true, Ordering::SeqCst);
         turso_assert!(
@@ -4661,14 +4667,16 @@ impl Connection {
             .read()
             .functions
             .values()
-            .map(|f| {
+            .flat_map(|f| {
                 let is_agg = f.func.is_aggregate();
-                (
-                    f.name.clone(),
-                    is_agg,
-                    f.func.arg_count(),
-                    function::Deterministic::is_deterministic(f.as_ref()),
-                )
+                f.func.arg_counts().into_iter().map(move |argc| {
+                    (
+                        f.name.clone(),
+                        is_agg,
+                        argc,
+                        function::Deterministic::is_deterministic(f.as_ref()),
+                    )
+                })
             })
             .collect()
     }
