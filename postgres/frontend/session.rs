@@ -129,7 +129,6 @@ impl PgConnection {
     /// A connection that attaches the schemas in `schemas` now and follows
     /// the changes other connections make to it.
     pub fn with_schemas(conn: Arc<Connection>, schemas: PgSchemas) -> Result<Self> {
-        aliases::install(&conn);
         let inner = Arc::new(PgConnectionInner {
             conn,
             session_state: Mutex::new(SessionState::default()),
